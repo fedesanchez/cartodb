@@ -395,6 +395,7 @@ describe Carto::Api::VisualizationsController do
         show_permission: false,
         show_synchronization: false,
         show_uses_builder_features: false,
+        show_auth_tokens: false,
         load_totals: false
       }.freeze
 
@@ -1371,6 +1372,38 @@ describe Carto::Api::VisualizationsController do
         response['likes'].should eq nil
       end
 
+      it 'returns a specific error for password-protected visualizations and required, public information' do
+        @visualization.privacy = Carto::Visualization::PRIVACY_PROTECTED
+        @visualization.password = 'wadus'
+        @visualization.save!
+        @visualization.user.update_attribute(:google_maps_key, 'waaaaadus')
+
+        expected_visualization_info = {
+          privacy: @visualization.privacy,
+          user: {
+            google_maps_query_string: @visualization.user.google_maps_query_string
+          }
+        }
+
+        get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
+          response.status.should eq 403
+          response.body[:errors].should eq "Visualization not viewable"
+          response.body[:errors_cause].should eq "privacy_password"
+          response.body[:visualization].should eq expected_visualization_info
+        end
+      end
+
+      it 'doesn\'t return a specific error for private visualizations' do
+        @visualization.privacy = Carto::Visualization::PRIVACY_PRIVATE
+        @visualization.save!
+
+        get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
+          response.status.should eq 403
+          response.body[:errors].should eq "Visualization not viewable"
+          response.body[:errors_cause].should be_nil
+        end
+      end
+
       it 'returns a visualization with optional information if requested' do
         url = api_v1_visualizations_show_url(
           id: @visualization.id,
@@ -1465,6 +1498,7 @@ describe Carto::Api::VisualizationsController do
                    show_liked: true,
                    show_likes: true,
                    show_permission: true,
+                   show_auth_tokens: true,
                    show_stats: true do |response|
             # We currently log 404 on errors. Maybe something that we should change in the future...
             response.status.should == 404
@@ -1479,6 +1513,7 @@ describe Carto::Api::VisualizationsController do
 
           get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
             response.status.should eq 403
+            expect(response.body[:errors]).to eq('Visualization not viewable')
           end
         end
 
@@ -1493,6 +1528,19 @@ describe Carto::Api::VisualizationsController do
 
             get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
               response.status.should eq 403
+              expect(response.body[:errors]).to eq('Visualization not viewable')
+            end
+          end
+
+          it 'returns 403 for unpublished and password protected visualizations' do
+            @visualization.published?.should eq false
+            @visualization.privacy = Carto::Visualization::PRIVACY_PROTECTED
+            @visualization.password = 'wadus'
+            @visualization.save!
+
+            get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
+              response.status.should eq 403
+              expect(response.body[:errors]).to eq('Visualization not viewable')
             end
           end
 
@@ -1510,13 +1558,13 @@ describe Carto::Api::VisualizationsController do
                 response.body[:tags].should_not be_nil
                 response.body[:title].should_not be_nil
                 response.body[:description].should_not be_nil
-                response.body[:auth_tokens].should eq []
 
                 # Optional information requiring parameters
+                response.body[:user].should eq nil
                 response.body[:liked].should eq nil
                 response.body[:likes].should eq 0
                 response.body[:stats].should be_empty
-
+                response.body[:auth_tokens].should be_empty
                 response.body[:permission].should eq nil
               end
             end
@@ -1527,14 +1575,21 @@ describe Carto::Api::VisualizationsController do
                 show_liked: true,
                 show_likes: true,
                 show_permission: true,
-                show_stats: true
+                show_auth_tokens: true,
+                show_stats: true,
+                fetch_user: true,
+                show_user_basemaps: true
               )
 
               get_json url do |response|
                 response.status.should eq 200
+                response.body[:user].should_not be_nil
                 response.body[:liked].should eq false
                 response.body[:likes].should eq 0
                 response.body[:stats].should_not be_empty
+
+                response_user = response.body[:user]
+                response_user[:basemaps].should be_nil # Even if requested, because it's not public
 
                 permission = response.body[:permission]
                 permission.should_not eq nil
@@ -1551,6 +1606,23 @@ describe Carto::Api::VisualizationsController do
               end
             end
 
+            it 'not only returns public information for authenticated requests' do
+              url = api_v1_visualizations_show_url(
+                id: @visualization.id,
+                fetch_user: true,
+                show_user_basemaps: true,
+                api_key: @visualization.user.api_key
+              )
+
+              get_json url do |response|
+                response.status.should eq 200
+                response.body[:user].should_not be_nil
+
+                response_user = response.body[:user]
+                response_user[:basemaps].should_not be_empty
+              end
+            end
+
             it 'returns auth_tokens for password protected visualizations if correct password is provided' do
               password = 'wadus'
               @visualization.privacy = Carto::Visualization::PRIVACY_PROTECTED
@@ -1559,13 +1631,22 @@ describe Carto::Api::VisualizationsController do
 
               get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
                 response.status.should eq 403
+                expect(response.body[:errors]).to eq('Visualization not viewable')
               end
 
               get_json api_v1_visualizations_show_url(id: @visualization.id, password: password * 2) do |response|
                 response.status.should eq 403
+                expect(response.body[:errors]).to eq('Visualization not viewable')
               end
 
               get_json api_v1_visualizations_show_url(id: @visualization.id, password: password) do |response|
+                response.status.should eq 200
+                response.body[:auth_tokens].should_not be_nil
+              end
+            end
+
+            it 'returns auth_tokens for password protected visualizations if requested by the owner' do
+              get_json api_v1_visualizations_show_url(id: @visualization.id) do |response|
                 response.status.should eq 200
                 response.body[:auth_tokens].should_not be_nil
               end
@@ -1578,11 +1659,15 @@ describe Carto::Api::VisualizationsController do
               end
 
               get_json api_v1_visualizations_show_url(id: @visualization.id), fetch_user: true do |response|
+                @visualization.user.update_attribute(:google_maps_key, 'waaaaadus')
+
                 response.status.should eq 200
                 user = response.body[:user]
                 user.should_not be_nil
                 user[:avatar_url].should_not be_nil
                 user[:quota_in_bytes].should be_nil
+                user[:google_maps_query_string].should_not be_nil
+                user[:google_maps_query_string].should eq @visualization.user.google_maps_query_string
               end
             end
 
